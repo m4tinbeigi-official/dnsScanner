@@ -1,346 +1,147 @@
-#!/bin/bash  -
-#===============================================================================
-#
-#          FILE: dnsScanner.sh
-#
-#         USAGE: ./dnsScanner.sh [Argumets]
-#
-#   DESCRIPTION: Scan subnets to find dns servers
-#
-#       OPTIONS: -h, --help
-#  REQUIREMENTS: getopt, jq, git, tput, bc, curl, parallel (version > 20220515), shuf
-#        AUTHOR: Morteza Bashsiz (mb), morteza.bashsiz@gmail.com
-#  ORGANIZATION: Linux
-#       CREATED: 19/01/2026 15:36:57 PM
-#      CONTRIBUTORS: MortezaBashsiz 
-#===============================================================================
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-export TOP_PID=$$
+BASE_DIR=$(pwd)
+CONFIG_DIR="$BASE_DIR/config"
+RUNTIME_DIR="$BASE_DIR/runtime"
+RESULT_DIR="$BASE_DIR/result"
+API_DIR="$BASE_DIR/api"
 
-# Function fncLongIntToStr
-# converts IP in long integer format to a string 
-fncLongIntToStr() {
-    local IFS=. num quad ip e
-    num=$1
-    for e in 3 2 1
-    do
-        (( quad = 256 ** e))
-        (( ip[3-e] = num / quad ))
-        (( num = num % quad ))
-    done
-    ip[3]=$num
-    echo "${ip[*]}"
+# فایل‌های اصلی
+DNS_DB="$RESULT_DIR/dns.txt"
+ACTIVE_POOL="$RUNTIME_DIR/active.pool"
+CLIENT_DB="$RUNTIME_DIR/clients.db"
+DOMAINS_FILE="$CONFIG_DIR/domains.conf"
+CLIENTS_FILE="$CONFIG_DIR/clients.conf"
+
+MAX_LATENCY=800
+ROTATE_INTERVAL=10
+API_PORT=9180
+WEB_PORT=9181
+
+# ایجاد دایرکتوری‌ها اگر وجود ندارند
+mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR" "$RESULT_DIR" "$API_DIR"
+
+# ایجاد فایل‌های پیش‌فرض اگر وجود ندارند
+[[ ! -f "$DNS_DB" ]] && echo -e "8.8.8.8 50\n8.8.4.4 55\n1.1.1.1 40\n1.0.0.1 42" > "$DNS_DB"
+[[ ! -f "$DOMAINS_FILE" ]] && echo -e "example.com\ngoogle.com\ncloudflare.com" > "$DOMAINS_FILE"
+[[ ! -f "$CLIENTS_FILE" ]] && echo -e "0.0.0.0/0 DEFAULT" > "$CLIENTS_FILE"
+[[ ! -f "$CLIENT_DB" ]] && touch "$CLIENT_DB"
+
+log() {
+  printf "[%s] %s\n" "$(date '+%H:%M:%S')" "$*" >&2
 }
-# End of Function fncLongIntToStr
 
-# Function fncIpToLongInt
-# converts IP to long integer 
-fncIpToLongInt() {
-    local IFS=. ip num e
-    # shellcheck disable=SC2206
-    ip=($1)
-    for e in 3 2 1
-    do
-        (( num += ip[3-e] * 256 ** e ))
-    done
-    (( num += ip[3] ))
-    echo $num
+ip2int() {
+  local a b c d
+  IFS=. read -r a b c d <<< "$1"
+  echo $(( (a<<24)+(b<<16)+(c<<8)+d ))
 }
-# End of Function fncIpToLongInt
 
-# Function fncSubnetToIP
-# converts subnet to IP list
-fncSubnetToIP() {
-  # shellcheck disable=SC2206
-  local network=(${1//\// })
-  # shellcheck disable=SC2206
-  local iparr=(${network[0]//./ })
-  local mask=32
-  [[ $((${#network[@]})) -gt 1 ]] && mask=${network[1]}
-
-  local maskarr
-  # shellcheck disable=SC2206
-  if [[ ${mask} = '\.' ]]; then  # already mask format like 255.255.255.0
-    maskarr=(${mask//./ })
-  else                           # assume CIDR like /24, convert to mask
-    if [[ $((mask)) -lt 8 ]]; then
-      maskarr=($((256-2**(8-mask))) 0 0 0)
-    elif  [[ $((mask)) -lt 16 ]]; then
-      maskarr=(255 $((256-2**(16-mask))) 0 0)
-    elif  [[ $((mask)) -lt 24 ]]; then
-      maskarr=(255 255 $((256-2**(24-mask))) 0)
-    elif [[ $((mask)) -lt 32 ]]; then
-      maskarr=(255 255 255 $((256-2**(32-mask))))
-    elif [[ ${mask} == 32 ]]; then
-      maskarr=(255 255 255 255)
-    fi
-  fi
-
-  # correct wrong subnet masks (e.g. 240.192.255.0 to 255.255.255.0)
-  [[ ${maskarr[2]} == 255 ]] && maskarr[1]=255
-  [[ ${maskarr[1]} == 255 ]] && maskarr[0]=255
-
-  # generate list of ip addresses
-  if [[ "$randomNumber" != "NULL" ]]
-  then
-    local bytes=(0 0 0 0)
-    for i in $(seq 0 $((255-maskarr[0]))); do
-      bytes[0]="$(( i+(iparr[0] & maskarr[0]) ))"
-      for j in $(seq 0 $((255-maskarr[1]))); do
-        bytes[1]="$(( j+(iparr[1] & maskarr[1]) ))"
-        for k in $(seq 0 $((255-maskarr[2]))); do
-          bytes[2]="$(( k+(iparr[2] & maskarr[2]) ))"
-          for l in $(seq 1 $((255-maskarr[3]))); do
-            bytes[3]="$(( l+(iparr[3] & maskarr[3]) ))"
-            ipList+=("$(printf "%d.%d.%d.%d" "${bytes[@]}")")
-          done
-        done
-      done
-    done
-    # Choose random IP addresses from generated IP list
-    mapfile -t ipList < <(shuf -e "${ipList[@]}")
-    mapfile -t ipList < <(shuf -e "${ipList[@]:0:$randomNumber}")
-    for i in "${ipList[@]}"; do 
-      echo "$i"
-    done
-  elif [[ "$randomNumber" == "NULL" ]]
-  then
-    local bytes=(0 0 0 0)
-    for i in $(seq 0 $((255-maskarr[0]))); do
-      bytes[0]="$(( i+(iparr[0] & maskarr[0]) ))"
-      for j in $(seq 0 $((255-maskarr[1]))); do
-        bytes[1]="$(( j+(iparr[1] & maskarr[1]) ))"
-        for k in $(seq 0 $((255-maskarr[2]))); do
-          bytes[2]="$(( k+(iparr[2] & maskarr[2]) ))"
-          for l in $(seq 1 $((255-maskarr[3]))); do
-            bytes[3]="$(( l+(iparr[3] & maskarr[3]) ))"
-            printf "%d.%d.%d.%d\n" "${bytes[@]}"
-          done
-        done
-      done
-    done
-  fi
+ip_in_subnet() {
+  local ip subnet base mask
+  ip="$1"
+  subnet="$2"
+  base="${subnet%/*}"
+  mask="${subnet#*/}"
+  (( $(ip2int "$ip") >> (32-mask) == $(ip2int "$base") >> (32-mask) ))
 }
-# End of Function fncSubnetToIP
 
-# Function fncShowProgress
-# Progress bar maker function (based on https://www.baeldung.com/linux/command-line-progress-bar)
-function fncShowProgress {
-  barCharDone="="
-  barCharTodo=" "
-  barSplitter='>'
-  barPercentageScale=2
-  current="$1"
-  total="$2"
-
-  barSize="$(($(tput cols)-70))" # 70 cols for description characters
-
-  # calculate the progress in percentage 
-  percent=$(bc <<< "scale=$barPercentageScale; 100 * $current / $total" )
-  # The number of done and todo characters
-  done=$(bc <<< "scale=0; $barSize * $percent / 100" )
-  todo=$(bc <<< "scale=0; $barSize - $done")
-  # build the done and todo sub-bars
-  doneSubBar=$(printf "%${done}s" | tr " " "${barCharDone}")
-  todoSubBar=$(printf "%${todo}s" | tr " " "${barCharTodo} - 1") # 1 for barSplitter
-  spacesSubBar=$(printf "%${todo}s" | tr " " " ")
-
-  # output the bar
-  progressBar="| Progress bar of main IPs: [${doneSubBar}${barSplitter}${todoSubBar}] ${percent}%${spacesSubBar}" # Some end space for pretty formatting
+select_active_pool() {
+  awk -v max="$MAX_LATENCY" '{if($2<=max)print $1,$2}' "$DNS_DB" | sort -k2 -n
 }
-# End of Function showProgress
 
-# Function fncCheckIPList
-# Check Subnet
-function fncCheckIPList {
-  local ipList resultFile domain
-  ipList="${1}"
-  resultFile="${3}"
-  domain="${4}"
+rotate_pool() {
+  local f="$1"
+  local c
+  c=$(wc -l < "$f")
+  ((c<=1)) && return
+  tail -n 1 "$f" > "$f.tmp"
+  head -n $((c-1)) "$f" >> "$f.tmp"
+  mv "$f.tmp" "$f"
+}
 
-  # set proper command for linux
-  if command -v timeout >/dev/null 2>&1; 
-  then
-      timeoutCommand="timeout"
-  else
-    # set proper command for mac
-    if command -v gtimeout >/dev/null 2>&1; 
-    then
-        timeoutCommand="gtimeout"
-    else
-        echo >&2 "I require 'timeout' command but it's not installed. Please install 'timeout' or an alternative command like 'gtimeout' and try again."
-        exit 1
-    fi
-  fi
-  for ip in ${ipList}
-    do
-      result=$(timeout 1 dig +short "$domain" @"$ip")
-      if [[ "$result" != "" ]]; then
-        echo -e "$ip" 
-        echo -e "$ip" >> "$resultFile" 
-      fi
+emit_resolv() {
+  local pool="$1"
+  local out="$2"
+  > "$out"
+  while read -r ip lat; do
+    echo "nameserver $ip" >> "$out"
+  done < "$pool"
+}
+
+detect_client_tag() {
+  local cip="$1"
+  while read -r subnet tag; do
+    [[ "$subnet" == "DEFAULT" ]] && echo "$tag" && return
+    ip_in_subnet "$cip" "$subnet" && echo "$tag" && return
+  done < "$CLIENTS_FILE"
+}
+
+dynamic_client_watch() {
+  tail -F /var/log/syslog 2>/dev/null | \
+  awk '/src=/{for(i=1;i<=NF;i++)if($i~"src="){split($i,a,"=");print a[2]}}' | \
+  while read -r cip; do
+    grep -q "$cip" "$CLIENT_DB" || echo "$cip" >> "$CLIENT_DB"
   done
 }
-# End of Function fncCheckIPList
-export -f fncCheckIPList
 
-# Function fncCheckDpnd
-# Check for dipendencies
-function fncCheckDpnd {
-  command -v jq >/dev/null 2>&1 || { echo >&2 "I require 'jq' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-  command -v parallel >/dev/null 2>&1 || { echo >&2 "I require 'parallel' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-  command -v bc >/dev/null 2>&1 || { echo >&2 "I require 'bc' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-  command -v timeout >/dev/null 2>&1 || { echo >&2 "I require 'timeout' but it's not installed. Please install it and try again."; kill -s 1 "$TOP_PID"; }
-}
-# End of Function fncCheckDpnd
+runtime_loop() {
+  while true; do
+    select_active_pool > "$ACTIVE_POOL"
+    rotate_pool "$ACTIVE_POOL"
+    emit_resolv "$ACTIVE_POOL" "$RUNTIME_DIR/resolv.default"
 
-# Function fncCreateDir
-# creates needed directory
-function fncCreateDir {
-  local dirPath
-  dirPath="${1}"
-  if [ ! -d "$dirPath" ]; then
-    mkdir -p "$dirPath"
-  fi
-}
-# End of Function fncCreateDir
+    while read -r cip; do
+      emit_resolv "$ACTIVE_POOL" "$RUNTIME_DIR/resolv.$cip"
+    done < "$CLIENT_DB"
 
-# Function fncMainCFFindSubnet
-# main Function for Subnet
-function fncMainCFFindSubnet {
-  local threads progressBar resultFile subnetsFile breakedSubnets network netmask 
-  threads="${1}"
-  progressBar="${2}"
-  resultFile="${3}"
-  subnetsFile="${4}"
-
-  if [[ "$subnetsFile" == "NULL" ]] 
-  then
-    echo "Specify subnet file"
-    exit 0
-  else
-    echo "Reading subnets from file $subnetsFile"
-    dnsSubnetList=$(cat "$subnetsFile")
-  fi
-  
-  ipListLength="0"
-  for subNet in ${dnsSubnetList}
-  do
-    breakedSubnets=
-    maxSubnet=24
-    network=${subNet%/*}
-    netmask=${subNet#*/}
-    if [[ ${netmask} -ge ${maxSubnet} ]]
-    then
-      breakedSubnets="${breakedSubnets} ${network}/${netmask}"
-    else
-      for i in $(seq 0 $(( $(( 2 ** (maxSubnet - netmask) )) - 1 )) )
-      do
-        breakedSubnets="${breakedSubnets} $( fncLongIntToStr $(( $( fncIpToLongInt "${network}" ) + $(( 2 ** ( 32 - maxSubnet ) * i )) )) )/${maxSubnet}"
-      done
-    fi
-    breakedSubnets=$(echo "${breakedSubnets}"|tr ' ' '\n')
-    for breakedSubnet in ${breakedSubnets}
-    do
-      ipListLength=$(( ipListLength+1 ))
-    done
+    sleep "$ROTATE_INTERVAL"
   done
+}
 
-  passedIpsCount=0
-  for subNet in ${dnsSubnetList}
-  do
-    breakedSubnets=
-    maxSubnet=24
-    network=${subNet%/*}
-    netmask=${subNet#*/}
-    if [[ ${netmask} -ge ${maxSubnet} ]]
-    then
-      breakedSubnets="${breakedSubnets} ${network}/${netmask}"
-    else
-      for i in $(seq 0 $(( $(( 2 ** (maxSubnet - netmask) )) - 1 )) )
-      do
-        breakedSubnets="${breakedSubnets} $( fncLongIntToStr $(( $( fncIpToLongInt "${network}" ) + $(( 2 ** ( 32 - maxSubnet ) * i )) )) )/${maxSubnet}"
-      done
-    fi
-    breakedSubnets=$(echo "${breakedSubnets}"|tr ' ' '\n')
-    for breakedSubnet in ${breakedSubnets}
-    do
-      fncShowProgress "$passedIpsCount" "$ipListLength"
-      ipList=$(fncSubnetToIP "$breakedSubnet")
-      tput cuu1; tput ed # rewrites Parallel's bar
-      #echo -e "${RED}$progressBar${NC}"
-      parallel --ll --bar -j "$threads" fncCheckIPList ::: "$ipList" ::: "$progressBar" ::: "$resultFile" ::: "$domain"
-      killall v2ray > /dev/null 2>&1
-      passedIpsCount=$(( passedIpsCount+1 ))
-    done
+api_server() {
+  while true; do
+    {
+      read line
+      echo "HTTP/1.1 200 OK"
+      echo "Content-Type: application/json"
+      echo
+      echo "{"
+      echo "\"dns_pool\":["
+      awk '{printf "{\"ip\":\"%s\",\"latency\":%s},",$1,$2}' "$ACTIVE_POOL" | sed 's/,$//'
+      echo "],"
+      echo "\"clients\":["
+      awk '{printf "\"%s\",",$1}' "$CLIENT_DB" | sed 's/,$//'
+      echo "]"
+      echo "}"
+    } | nc -l "$API_PORT"
   done
-  sort -n -k1 -t, "$resultFile" -o "$resultFile"
 }
-# End of Function fncMainCFFindSubnet
 
-clientConfigFile="NULL"
-subnetIPFile="NULL"
-
-# Function fncUsage
-# usage function
-function fncUsage {
-  echo -e "Usage: dnsScanner
-    [ -p|--thread <int> ]
-    [ -f|--file <string> ]
-    [ -d|--domain <string> ]
-    [ -h|--help ]\n"
-  exit 2
+web_panel() {
+  while true; do
+    {
+      read line
+      echo "HTTP/1.1 200 OK"
+      echo "Content-Type: text/html"
+      echo
+      echo "<html><body>"
+      echo "<h2>DNS Orchestrator</h2>"
+      echo "<h3>Active DNS</h3><pre>"
+      cat "$ACTIVE_POOL"
+      echo "</pre><h3>Clients</h3><pre>"
+      cat "$CLIENT_DB"
+      echo "</pre></body></html>"
+    } | nc -l "$WEB_PORT"
+  done
 }
-# End of Function fncUsage
 
-threads="4"
+log "Self-Initializing DNS Orchestrator started"
+dynamic_client_watch &
+runtime_loop &
+api_server &
+web_panel &
 
-parsedArguments=$(getopt -a -n dnsScanner -o p:f:d:h --long thread:,file:,domain:,help -- "$@")
-
-eval set -- "$parsedArguments"
-while :
-do
-  case "$1" in
-    -p|--thread) threads="$2" ; shift 2 ;;
-    -f|--file) subnetIPFile="$2" ; shift 2 ;;
-    -d|--domain) domain="$2" ; shift 2 ;;
-    -h|--help) fncUsage ;;
-    --) shift; break ;;
-    *) echo "Unexpected option: $1 is not acceptable"
-    fncUsage ;;
-  esac
-done
-
-validArguments=$?
-if [ "$validArguments" != "0" ]; then
-  echo "error validate"
-  exit 2
-fi
-
-if [[ "$subnetIPFile" != "NULL" ]]
-then
-  if ! [[ -f "$subnetIPFile" ]]
-  then
-    echo "file does not exists: $subnetIPFile"
-    exit 1
-  fi
-fi
-
-now=$(date +"%Y%m%d-%H%M%S")
-scriptDir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-resultDir="$scriptDir/result"
-resultFile="$resultDir/$now.txt"
-
-progressBar=""
-randomNumber="NULL"
-export GREEN='\033[0;32m'
-export BLUE='\033[0;34m'
-export RED='\033[0;31m'
-export ORANGE='\033[0;33m'
-export YELLOW='\033[1;33m'
-export NC='\033[0m'
-
-fncCreateDir "${resultDir}"
-echo "" > "$resultFile"
-
-fncMainCFFindSubnet "$threads" "$progressBar" "$resultFile" "$subnetIPFile"
+wait
